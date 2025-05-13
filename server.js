@@ -1,20 +1,29 @@
-/***************************************************************
- * iSECTECH Proxy – External‑API Scanner
- * -------------------------------------------------------------
- * 1. securityheaders.com  (fast, 1–2 s)
- * 2. Qualys SSL Labs      (may take 30–90 s → we poll)
- * 3. Local header fallback rules
- **************************************************************/
+/*****************************************************************
+ * iSECTECH Proxy – Quick + Advanced Scanner
+ * --------------------------------------------------------------
+ * POST /scan
+ *   body:{
+ *     target : "https://example.com" | "1.2.3.4",
+ *     profile: "quick" | "full",
+ *     creds? : "...",
+ *     user?  : { email, phone, country }
+ *   }
+ *   → { findings:[ {severity,title,fix}, … ] }
+ *
+ * GET  /health → { status:"up" }
+ *****************************************************************/
 require('dotenv').config();
 const express = require('express');
 const axios   = require('axios');
 const https   = require('https');
 const url     = require('url');
+const net     = require('net');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+const SHODAN_KEY = process.env.SHODAN_KEY;      // optional
 
-/* ─── CORS & JSON ─────────────────────────────────────────── */
+/* ─── middleware (CORS + JSON) ───────────────────────────────── */
 app.use((req,res,next)=>{
   res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Access-Control-Allow-Methods','GET,POST,OPTIONS');
@@ -24,14 +33,16 @@ app.use((req,res,next)=>{
 });
 app.use(express.json());
 
-/* ─── POST /scan ──────────────────────────────────────────── */
+/* ─── POST /scan ─────────────────────────────────────────────── */
 app.post('/scan', async (req,res)=>{
-  const { target } = req.body || {};
+  const { target, profile='quick' } = req.body || {};
   if(!target || typeof target!=='string'){
-    return res.status(400).json({ error:'target is required (string)'});
+    return res.status(400).json({ error:'target (string) is required' });
   }
   try{
-    const findings = await runExternalScan(target.trim());
+    const findings = profile==='full'
+      ? await runAdvancedScan(target.trim())
+      : await runQuickScan(target.trim());
     res.json({ findings });
   }catch(e){
     console.error(e);
@@ -39,146 +50,104 @@ app.post('/scan', async (req,res)=>{
   }
 });
 
-/* === Core scanner ======================================================= */
-async function runExternalScan(targetRaw){
-  const host = tidyHost(targetRaw);
+/* ─── Quick scan (headers + simple heuristics) ───────────────── */
+async function runQuickScan(raw){
+  const snap = await getHeaderSnapshot(raw);
+  if(snap.error){
+    return [{ severity:'high', title:`Unreachable: ${snap.error}`, fix:'Check DNS / firewall.' }];
+  }
+  return basicHeaderRules(raw, snap.headers);
+}
 
-  /* 1) Kick off both API requests in parallel */
-  const [sh, ssl] = await Promise.allSettled([
-    scanSecurityHeaders(host),
-    scanSslLabs(host)
+/* ─── Advanced scan (3 external services) ────────────────────── */
+async function runAdvancedScan(raw){
+  const host = tidyHost(raw);
+  const [sh, ssl, shd] = await Promise.allSettled([
+    axios.get(`https://securityheaders.com/?q=${encodeURIComponent('https://'+host)}&followRedirects=on&hide=on&json=on`,{timeout:10000}),
+    sslLabsScan(host),
+    SHODAN_KEY ? axios.get(`https://api.shodan.io/shodan/host/${host}?key=${SHODAN_KEY}`,{timeout:10000}) : Promise.resolve({status:'rejected'})
   ]);
 
   let findings = [];
+  if(sh.status==='fulfilled')  findings.push(...mapSecurityHeaders(sh.value.data));
+  if(ssl.status==='fulfilled') findings.push(...mapSsl(ssl.value));
+  if(shd.status==='fulfilled') findings.push(...mapShodan(shd.value.data));
 
-  /* Map SecurityHeaders result */
-  if(sh.status==='fulfilled'){
-    findings = findings.concat(mapSH(sh.value));
-  }
-
-  /* Map SSL Labs result */
-  if(ssl.status==='fulfilled'){
-    findings = findings.concat(mapSSL(ssl.value));
-  }
-
-  /* If both failed, fall back to basic header check */
+  /* fallback so user always gets something */
   if(!findings.length){
-    const fallback = await basicHeaderRules(host);
-    findings = findings.concat(fallback);
+    const snap = await getHeaderSnapshot(raw);
+    findings = snap.error ? [{
+      severity:'high', title:`Unreachable: ${snap.error}`, fix:'Check DNS / firewall.'
+    }] : basicHeaderRules(raw,snap.headers);
   }
-
   return findings;
 }
 
-/* ── Helpers ───────────────────────────────────────────────── */
-function tidyHost(raw){
-  return raw.replace(/^https?:\/\//i,'').replace(/\/.*$/,'');
-}
+/* ─── Helpers ░░ Network snapshots ░░─────────────────────────── */
+function tidyHost(raw){return raw.replace(/^https?:\/\//i,'').replace(/\/.*$/,'');}
 
-/* SecurityHeaders.com scan */
-async function scanSecurityHeaders(host){
-  const { data } = await axios.get(
-    `https://securityheaders.com/?q=${encodeURIComponent('https://'+host)}&followRedirects=on&hide=on&json=on`,
-    { timeout: 10000, httpsAgent:new https.Agent({rejectUnauthorized:false}) }
-  );
-  return data; // includes grade + header list
-}
-
-/* SSL Labs scan with polling (max 4×15 s) */
-async function scanSslLabs(host){
-  const base = 'https://api.ssllabs.com/api/v3/analyze';
-  let attempt = 0;
-  while(attempt<4){
-    const { data } = await axios.get(base, {
-      params:{ host, publish:'off', all:'done', fromCache:'on', ignoreMismatch:'on' },
-      timeout: 15000
-    });
-    if(data.status==='READY') return data;          // full report
-    if(data.status==='ERROR') throw new Error(data.statusMessage);
-    await wait(15000); // poll every 15 s
-    attempt++;
-  }
-  throw new Error('SSL Labs timed‑out');
-}
-
-/* Wait helper */
-const wait = ms=>new Promise(r=>setTimeout(r,ms));
-
-/* Map results to findings */
-function mapSH(res){
-  const list=[];
-  if(res.grade){
-    const sev = gradeToSeverity(res.grade);
-    list.push({
-      severity:sev,
-      title:`SecurityHeaders grade ${res.grade}`,
-      fix:'Add missing headers to improve grade.'
-    });
-  }
-  (res['missing']||[]).forEach(h=>{
-    list.push({
-      severity:'medium',
-      title:`Missing ${h} header`,
-      fix:`Add ${h} header with secure value.`
-    });
-  });
-  (res['partial']||[]).forEach(h=>{
-    list.push({
-      severity:'low',
-      title:`${h} header present but weak`,
-      fix:`Review ${h} header value and tighten policy.`
-    });
-  });
-  return list;
-}
-
-function mapSSL(res){
-  const list=[];
-  if(res.endpoints && res.endpoints[0]){
-    const ep = res.endpoints[0];
-    if(ep.grade){
-      list.push({
-        severity: gradeToSeverity(ep.grade),
-        title   : `TLS grade ${ep.grade}`,
-        fix     : 'Upgrade weak ciphers/protocols; enable HSTS and OCSP stapling.'
-      });
-    }
-    if(ep.details && ep.details.cert && ep.details.cert.notAfter){
-      const days = Math.round((ep.details.cert.notAfter/1000 - Date.now()/1000)/86400);
-      if(days < 30){
-        list.push({
-          severity:'medium',
-          title   : `TLS certificate expires in ${days} days`,
-          fix     : 'Renew certificate before it expires.'
-        });
-      }
-    }
-  }
-  return list;
-}
-
-function gradeToSeverity(g){
-  if(['A+','A'].includes(g)) return 'low';
-  if(['B','C'].includes(g))  return 'medium';
-  return 'high';
-}
-
-/* Basic header fallback (same quick heuristics) */
-async function basicHeaderRules(host){
+async function getHeaderSnapshot(raw){
+  const guess = raw.match(/^https?:\/\//i) ? raw : `https://${raw}`;
   try{
-    const { headers } = await axios.head('https://'+host,{ timeout:7000 });
-    const h = Object.fromEntries(Object.entries(headers).map(([k,v])=>[k.toLowerCase(),v]));
-    const list=[];
-    if(!h['strict-transport-security']) list.push({severity:'medium',title:'Missing HSTS',fix:'Add Strict‑Transport‑Security.'});
-    if(!h['content-security-policy'])   list.push({severity:'medium',title:'Missing CSP',fix:'Add Content‑Security‑Policy.'});
-    if(!h['x-frame-options'])           list.push({severity:'low',   title:'Missing X‑Frame‑Options',fix:'Add SAMEORIGIN or DENY.'});
-    if(h['server'])                     list.push({severity:'low',   title:`Server banner: ${h['server']}`,fix:'Remove or obfuscate Server header.'});
-    return list;
-  }catch{ return [];}
+    const r=await axios.head(guess,{timeout:6000,maxRedirects:3,httpsAgent:new https.Agent({rejectUnauthorized:false})});
+    return { status:r.status, headers:r.headers };
+  }catch(e){ return { error:e.code||e.message }; }
 }
 
-/* Health */
+/* ─── Mapping helpers ────────────────────────────────────────── */
+function basicHeaderRules(raw,headers){
+  const h=Object.fromEntries(Object.entries(headers).map(([k,v])=>[k.toLowerCase(),v]));
+  const list=[];
+  if(!h['strict-transport-security']) list.push({severity:'medium',title:'Missing HSTS',fix:'Add Strict‑Transport‑Security.'});
+  if(!h['content-security-policy'])   list.push({severity:'medium',title:'Missing CSP', fix:'Add Content‑Security‑Policy.'});
+  if(!h['x-frame-options'])           list.push({severity:'low',   title:'Missing X‑Frame‑Options', fix:'Add SAMEORIGIN or DENY.'});
+  if(h['server'])                     list.push({severity:'low',   title:`Server banner: ${h['server']}`, fix:'Remove or obfuscate Server header.'});
+  return list.length?list:[{severity:'low',title:`No obvious header issues for ${tidyHost(raw)}`,fix:'Run advanced scan for deeper checks.'}];
+}
+
+function gradeToSeverity(g){ if(['A+','A'].includes(g))return'low'; if(['B','C'].includes(g))return 'medium'; return 'high'; }
+
+function mapSecurityHeaders(d){
+  const out=[];
+  if(d.grade) out.push({severity:gradeToSeverity(d.grade),title:`SecurityHeaders grade ${d.grade}`,fix:'Add or strengthen headers to improve grade.'});
+  (d.missing||[]).forEach(h=>out.push({severity:'medium',title:`Missing ${h} header`,fix:`Add ${h}`}));
+  (d.partial||[]).forEach(h=>out.push({severity:'low',title:`${h} header weak`,fix:`Harden ${h}`}));
+  return out;
+}
+
+function mapSsl(r){
+  const ep=r.endpoints&&r.endpoints[0]; if(!ep) return [];
+  const list=[{severity:gradeToSeverity(ep.grade||'F'),title:`TLS grade ${ep.grade||'F'}`,fix:'Upgrade weak ciphers / protocols, enable HSTS.'}];
+  if(ep.details?.cert?.notAfter){
+    const days=Math.round((ep.details.cert.notAfter/1000-Date.now()/1000)/86400);
+    if(days<30) list.push({severity:'medium',title:`TLS cert expires in ${days} days`,fix:'Renew certificate.'});
+  }
+  return list;
+}
+
+function mapShodan(d){
+  if(!d.ports) return [];
+  return d.ports.map(p=>({
+    severity:p===22||p===3389?'high':'medium',
+    title   :`Port ${p} open (${d.hostnames?.[0]||d.ip_str})`,
+    fix     :'Restrict access or close the service if not needed.'
+  }));
+}
+
+/* ─── SSL Labs polling helper ───────────────────────────────── */
+async function sslLabsScan(host){
+  const base='https://api.ssllabs.com/api/v3/analyze';
+  for(let i=0;i<12;i++){    // up to 12×15 s = 3 min
+    const { data } = await axios.get(base,{params:{host,publish:'off',all:'done',fromCache:'on',ignoreMismatch:'on'},timeout:15000});
+    if(data.status==='READY') return data;
+    if(['ERROR','DNS'].includes(data.status)) throw new Error(data.statusMessage||'SSL Labs error');
+    await new Promise(r=>setTimeout(r,15000));
+  }
+  throw new Error('SSL Labs timed out');
+}
+
+/* ─── Health ────────────────────────────────────────────────── */
 app.get('/health',(_q,r)=>r.json({status:'up'}));
 
-/* Start */
-app.listen(PORT, ()=>console.log('Proxy running on',PORT));
+/* ─── Start ─────────────────────────────────────────────────── */
+app.listen(PORT,()=>console.log('Proxy running on',PORT));
