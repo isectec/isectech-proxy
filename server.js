@@ -1,105 +1,148 @@
 /**
- * iSECTECH Proxy – Simple‑Heuristic Scanner
- * ----------------------------------------
- * POST /scan   { target, profile, creds? } → { findings:[ … ] }
- * GET  /health                            → { status:"up" }
- * ----------------------------------------
- * The generateFindings() function below applies **basic rules**:
- *   • HTTP—not‑HTTPS  → HIGH
- *   • IP address      → MEDIUM (discloses infra)
- *   • Default port 80 → LOW
- *   • CIDR /24 range  → LOW
- * Replace generateFindings() with your own engine when ready.
+ * iSECTECH Quick Scanner – header & transport checks
+ * ──────────────────────────────────────────────────────────────
+ * POST /scan { target, profile, creds? }
+ *      → { findings:[ {severity,title,fix}, … ] }
+ *
+ * What it checks
+ * ──────────────
+ *   • HTTP  (not HTTPS)               → HIGH
+ *   • Server unreachable / timeout    → HIGH
+ *   • IP address instead of hostname  → MEDIUM
+ *   • Missing Strict‑Transport‑Security header → MEDIUM
+ *   • Missing Content‑Security‑Policy header   → MEDIUM
+ *   • Missing X‑Frame‑Options header           → LOW
+ *   • “Server:” banner present                 → LOW
+ *
+ * GET /health → { status:"up" }
+ * CORS wide‑open while testing
  */
 require('dotenv').config();
 const express = require('express');
+const axios   = require('axios');
+const https   = require('https');
 const url     = require('url');
 const net     = require('net');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-/* ───────────────────── 1. CORS + JSON ─────────────────────── */
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+/* ───────── 1. CORS & JSON ─────────────────────────────────── */
+app.use((req,res,next)=>{
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization');
+  if(req.method==='OPTIONS') return res.sendStatus(204);
   next();
 });
 app.use(express.json());
 
-/* ───────────────────── 2. /scan ───────────────────────────── */
-app.post('/scan', async (req, res) => {
-  const { target, profile = 'quick', creds } = req.body || {};
-  if (!target || typeof target !== 'string') {
-    return res.status(400).json({ error: 'target is required (string)' });
+/* ───────── 2. /scan ───────────────────────────────────────── */
+app.post('/scan', async (req,res)=>{
+  const { target } = req.body || {};
+  if(!target || typeof target !== 'string'){
+    return res.status(400).json({ error:'target is required (string)' });
   }
-  try {
-    const findings = await generateFindings({ target, profile, creds });
+  try{
+    const findings = await analyseTarget(target.trim());
     res.json({ findings });
-  } catch (err) {
+  }catch(err){
     console.error(err);
-    res.status(500).json({ error: 'scan failed' });
+    res.status(500).json({ error:'scan failed' });
   }
 });
 
-/* ─────────── Simple demo rules you can extend now ─────────── */
-async function generateFindings({ target }) {
+/* ───────── Heuristic analysis function ───────────────────── */
+async function analyseTarget(raw){
+  // normalise url
+  const guess = raw.match(/^https?:\/\//i) ? raw : `https://${raw}`;
+  const parsed = url.parse(guess);
+  const host   = parsed.hostname || raw;
+
   const findings = [];
-  const trimmed  = target.trim().split(/\s+/)[0];           // first line only
-  const isCIDR   = /\/\d+$/.test(trimmed);
-  const parsed   = url.parse(trimmed.startsWith('http') ? trimmed : `scheme://${trimmed}`);
 
-  /* 1) HTTP (unencrypted) */
-  if (parsed.protocol === 'http:') {
+  /* 1. Scheme check */
+  if(parsed.protocol === 'http:'){
     findings.push({
-      severity : 'high',
-      title    : 'Target served over HTTP (unencrypted)',
-      fix      : 'Redirect to HTTPS and install a valid TLS certificate.'
+      severity:'high',
+      title:'Target served over HTTP (unencrypted)',
+      fix:'Force HTTPS and install a TLS certificate.'
     });
   }
 
-  /* 2) Raw IP address */
-  if (net.isIP(parsed.hostname)) {
+  /* 2. IP address check */
+  if(net.isIP(host)){
     findings.push({
-      severity : 'medium',
-      title    : 'Target is an IP address (possible direct server exposure)',
-      fix      : 'Use a hostname behind reverse proxy/CDN if possible.'
+      severity:'medium',
+      title:'Target is a raw IP address',
+      fix:'Use a hostname behind a proxy/CDN to reduce exposure.'
     });
   }
 
-  /* 3) Default port 80 with no TLS */
-  if (parsed.port === '80' || (!parsed.port && parsed.protocol === 'http:')) {
-    findings.push({
-      severity : 'low',
-      title    : 'Default port 80 detected',
-      fix      : 'Close port 80 or redirect traffic to 443.'
+  /* 3. Attempt HEAD request (5 s timeout, follow redirects) */
+  let resp;
+  try{
+    resp = await axios.head(guess, {
+      maxRedirects: 3,
+      timeout     : 5000,
+      httpsAgent  : new https.Agent({ rejectUnauthorized:false })
     });
+  }catch(e){
+    findings.push({
+      severity:'high',
+      title:`Server unreachable (${e.code||e.message})`,
+      fix:'Verify DNS, firewall and that the site is up.'
+    });
+    return findings;                     // cannot continue header checks
   }
 
-  /* 4) CIDR range submitted */
-  if (isCIDR) {
+  const h = Object.fromEntries(
+    Object.entries(resp.headers).map(([k,v])=>[k.toLowerCase(),v])
+  );
+
+  /* 4. Header checks */
+  if(!h['strict-transport-security']){
     findings.push({
-      severity : 'low',
-      title    : 'CIDR / range provided – large scope scan',
-      fix      : 'Confirm you have permission to scan the whole range.'
+      severity:'medium',
+      title:'Missing Strict‑Transport‑Security header',
+      fix:'Add HSTS to enforce HTTPS (e.g. max‑age=31536000; includeSubDomains).'
     });
   }
-
-  // Always return at least one finding so UI shows something.
-  if (!findings.length) {
+  if(!h['content-security-policy']){
+    findings.push({
+      severity:'medium',
+      title:'Missing Content‑Security‑Policy header',
+      fix:'Add a CSP to mitigate XSS and data‑injection.'
+    });
+  }
+  if(!h['x-frame-options']){
     findings.push({
       severity:'low',
-      title:`No heuristic issues for ${parsed.hostname || trimmed}`,
-      fix:'Run a full scanner (OWASP ZAP, Nmap, etc.) for deeper checks.'
+      title:'Missing X‑Frame‑Options header',
+      fix:'Add SAMEORIGIN or DENY to prevent clickjacking.'
+    });
+  }
+  if(h['server']){
+    findings.push({
+      severity:'low',
+      title:`Server banner disclosed: ${h['server']}`,
+      fix:'Remove or obfuscate the Server header.'
+    });
+  }
+
+  /* 5. Nothing found? */
+  if(!findings.length){
+    findings.push({
+      severity:'low',
+      title:`No issues detected by header rules for ${host}`,
+      fix:'Run a full scanner (OWASP ZAP, Nmap, etc.) for deeper checks.'
     });
   }
   return findings;
 }
 
-/* ───────────────────── 3. /health ─────────────────────────── */
-app.get('/health', (_req, res) => res.json({ status:'up' }));
+/* ───────── 3. Health ─────────────────────────────────────── */
+app.get('/health',(_req,res)=>res.json({status:'up'}));
 
-/* ───────────────────── 4. start ───────────────────────────── */
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+/* ───────── 4. Start ──────────────────────────────────────── */
+app.listen(PORT,()=>console.log('Proxy running on port',PORT));
