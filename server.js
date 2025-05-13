@@ -1,150 +1,184 @@
-/****************************************************************
- * iSECTECH Proxy – AI‑Assisted Quick Scanner
+/***************************************************************
+ * iSECTECH Proxy – External‑API Scanner
  * -------------------------------------------------------------
- * POST /scan { target, profile, creds? }
- *         → { findings:[ {severity,title,fix}, … ] }
- * GET  /health → { status:"up" }
- *
- * Uses OpenAI to analyse HTTP response headers and return
- * structured findings.  Falls back to built‑in heuristics if
- * the AI call errors or returns nothing.
- ****************************************************************/
+ * 1. securityheaders.com  (fast, 1–2 s)
+ * 2. Qualys SSL Labs      (may take 30–90 s → we poll)
+ * 3. Local header fallback rules
+ **************************************************************/
 require('dotenv').config();
 const express = require('express');
 const axios   = require('axios');
 const https   = require('https');
 const url     = require('url');
-const net     = require('net');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
-const OPENAI_KEY = process.env.OPENAI_API_KEY;  // set this in Railway!
 
-/* ─────── 1. Global middleware (CORS + JSON) ───────────────── */
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+/* ─── CORS & JSON ─────────────────────────────────────────── */
+app.use((req,res,next)=>{
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization');
+  if(req.method==='OPTIONS') return res.sendStatus(204);
   next();
 });
 app.use(express.json());
 
-/* ─────── 2. Main scan endpoint ────────────────────────────── */
-app.post('/scan', async (req, res) => {
+/* ─── POST /scan ──────────────────────────────────────────── */
+app.post('/scan', async (req,res)=>{
   const { target } = req.body || {};
-  if (!target || typeof target !== 'string') {
-    return res.status(400).json({ error: 'target is required (string)' });
+  if(!target || typeof target!=='string'){
+    return res.status(400).json({ error:'target is required (string)'});
   }
-  try {
-    const findings = await generateFindings(target.trim());
-    return res.json({ findings });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'scan failed' });
+  try{
+    const findings = await runExternalScan(target.trim());
+    res.json({ findings });
+  }catch(e){
+    console.error(e);
+    res.status(500).json({ error:'scan failed' });
   }
 });
 
-/* ─────── Core logic: AI + fallback heuristics ─────────────── */
-async function generateFindings(rawTarget) {
-  /* 1. Snapshot headers/status */
-  const snap = await getHeaderSnapshot(rawTarget);          // { status, headers } or { error }
-  if (snap.error) {
-    return [{ severity:'high', title:'Unreachable: ' + snap.error, fix:'Verify DNS / connectivity.' }];
+/* === Core scanner ======================================================= */
+async function runExternalScan(targetRaw){
+  const host = tidyHost(targetRaw);
+
+  /* 1) Kick off both API requests in parallel */
+  const [sh, ssl] = await Promise.allSettled([
+    scanSecurityHeaders(host),
+    scanSslLabs(host)
+  ]);
+
+  let findings = [];
+
+  /* Map SecurityHeaders result */
+  if(sh.status==='fulfilled'){
+    findings = findings.concat(mapSH(sh.value));
   }
 
-  /* 2. Try OpenAI */
-  if (OPENAI_KEY) {
-    try {
-      const aiFindings = await askOpenAI(rawTarget, snap);
-      if (aiFindings?.length) return aiFindings;
-    } catch (e) {
-      console.error('OpenAI failure, falling back:', e.response?.data || e.message);
-    }
+  /* Map SSL Labs result */
+  if(ssl.status==='fulfilled'){
+    findings = findings.concat(mapSSL(ssl.value));
   }
 
-  /* 3. Fallback heuristics */
-  return basicHeaderRules(rawTarget, snap);
-}
-
-/* ── Helper: fetch headers with 6 s timeout & follow redirects */
-async function getHeaderSnapshot(raw) {
-  const guess = raw.match(/^https?:\/\//i) ? raw : `https://${raw}`;
-  try {
-    const resp = await axios.head(guess, {
-      timeout      : 6000,
-      maxRedirects : 3,
-      httpsAgent   : new https.Agent({ rejectUnauthorized:false })
-    });
-    return {
-      status  : resp.status,
-      headers : resp.headers
-    };
-  } catch(e) {
-    return { error: e.code || e.message };
+  /* If both failed, fall back to basic header check */
+  if(!findings.length){
+    const fallback = await basicHeaderRules(host);
+    findings = findings.concat(fallback);
   }
+
+  return findings;
 }
 
-/* ── Helper: OpenAI function call style ────────────────────── */
-async function askOpenAI(target, snap) {
-  const systemMsg = `
-You are a senior web‑application pentester.
-Given an HTTP response snapshot, output JSON:
-{
-  "findings":[
-    { "severity":"critical|high|medium|low", "title":"...", "fix":"..." }
-  ]
+/* ── Helpers ───────────────────────────────────────────────── */
+function tidyHost(raw){
+  return raw.replace(/^https?:\/\//i,'').replace(/\/.*$/,'');
 }
-Titles max 90 chars, fixes max 140 chars.`;
-  const userMsg = JSON.stringify({ target, ...snap }, null, 2);
 
-  const { data } = await axios.post(
-    'https://api.openai.com/v1/chat/completions',
-    {
-      model: 'gpt-4o-mini',            // or gpt-4o / gpt-3.5-turbo
-      temperature: 0.2,
-      messages: [
-        { role:'system', content: systemMsg },
-        { role:'user',   content: userMsg  }
-      ],
-      response_format: { type:'json_object' }
-    },
-    { headers: { Authorization:`Bearer ${OPENAI_KEY}` } }
+/* SecurityHeaders.com scan */
+async function scanSecurityHeaders(host){
+  const { data } = await axios.get(
+    `https://securityheaders.com/?q=${encodeURIComponent('https://'+host)}&followRedirects=on&hide=on&json=on`,
+    { timeout: 10000, httpsAgent:new https.Agent({rejectUnauthorized:false}) }
   );
-
-  const parsed = JSON.parse(data.choices[0].message.content || '{}');
-  return parsed.findings;
+  return data; // includes grade + header list
 }
 
-/* ── Fallback heuristic rules (same as before) ─────────────── */
-function basicHeaderRules(raw, { headers }) {
-  const host = url.parse(raw.match(/^https?:\/\//) ? raw : `https://${raw}`).hostname || raw;
-  const h = Object.fromEntries(Object.entries(headers).map(([k,v])=>[k.toLowerCase(),v]));
-  const list = [];
+/* SSL Labs scan with polling (max 4×15 s) */
+async function scanSslLabs(host){
+  const base = 'https://api.ssllabs.com/api/v3/analyze';
+  let attempt = 0;
+  while(attempt<4){
+    const { data } = await axios.get(base, {
+      params:{ host, publish:'off', all:'done', fromCache:'on', ignoreMismatch:'on' },
+      timeout: 15000
+    });
+    if(data.status==='READY') return data;          // full report
+    if(data.status==='ERROR') throw new Error(data.statusMessage);
+    await wait(15000); // poll every 15 s
+    attempt++;
+  }
+  throw new Error('SSL Labs timed‑out');
+}
 
-  if (net.isIP(host)) {
-    list.push({ severity:'medium', title:'Target is an IP address', fix:'Use hostname behind CDN/proxy.' });
+/* Wait helper */
+const wait = ms=>new Promise(r=>setTimeout(r,ms));
+
+/* Map results to findings */
+function mapSH(res){
+  const list=[];
+  if(res.grade){
+    const sev = gradeToSeverity(res.grade);
+    list.push({
+      severity:sev,
+      title:`SecurityHeaders grade ${res.grade}`,
+      fix:'Add missing headers to improve grade.'
+    });
   }
-  if (!h['strict-transport-security']) {
-    list.push({ severity:'medium', title:'Missing Strict‑Transport‑Security header', fix:'Add HSTS max-age=31536000.' });
-  }
-  if (!h['content-security-policy']) {
-    list.push({ severity:'medium', title:'Missing Content‑Security‑Policy header', fix:'Add CSP to mitigate XSS.' });
-  }
-  if (!h['x-frame-options']) {
-    list.push({ severity:'low', title:'Missing X‑Frame‑Options header', fix:'Add SAMEORIGIN or DENY.' });
-  }
-  if (h['server']) {
-    list.push({ severity:'low', title:`Server banner disclosed: ${h['server']}`, fix:'Remove or obfuscate Server header.' });
-  }
-  if (!list.length) {
-    list.push({ severity:'low', title:`No obvious header issues for ${host}`, fix:'Run deeper dynamic scan for vulns.' });
+  (res['missing']||[]).forEach(h=>{
+    list.push({
+      severity:'medium',
+      title:`Missing ${h} header`,
+      fix:`Add ${h} header with secure value.`
+    });
+  });
+  (res['partial']||[]).forEach(h=>{
+    list.push({
+      severity:'low',
+      title:`${h} header present but weak`,
+      fix:`Review ${h} header value and tighten policy.`
+    });
+  });
+  return list;
+}
+
+function mapSSL(res){
+  const list=[];
+  if(res.endpoints && res.endpoints[0]){
+    const ep = res.endpoints[0];
+    if(ep.grade){
+      list.push({
+        severity: gradeToSeverity(ep.grade),
+        title   : `TLS grade ${ep.grade}`,
+        fix     : 'Upgrade weak ciphers/protocols; enable HSTS and OCSP stapling.'
+      });
+    }
+    if(ep.details && ep.details.cert && ep.details.cert.notAfter){
+      const days = Math.round((ep.details.cert.notAfter/1000 - Date.now()/1000)/86400);
+      if(days < 30){
+        list.push({
+          severity:'medium',
+          title   : `TLS certificate expires in ${days} days`,
+          fix     : 'Renew certificate before it expires.'
+        });
+      }
+    }
   }
   return list;
 }
 
-/* ─────── 3. Health ────────────────────────────────────────── */
-app.get('/health', (_req,res)=>res.json({ status:'up' }));
+function gradeToSeverity(g){
+  if(['A+','A'].includes(g)) return 'low';
+  if(['B','C'].includes(g))  return 'medium';
+  return 'high';
+}
 
-/* ─────── 4. Start ─────────────────────────────────────────── */
-app.listen(PORT, () => console.log('Proxy running on port', PORT));
+/* Basic header fallback (same quick heuristics) */
+async function basicHeaderRules(host){
+  try{
+    const { headers } = await axios.head('https://'+host,{ timeout:7000 });
+    const h = Object.fromEntries(Object.entries(headers).map(([k,v])=>[k.toLowerCase(),v]));
+    const list=[];
+    if(!h['strict-transport-security']) list.push({severity:'medium',title:'Missing HSTS',fix:'Add Strict‑Transport‑Security.'});
+    if(!h['content-security-policy'])   list.push({severity:'medium',title:'Missing CSP',fix:'Add Content‑Security‑Policy.'});
+    if(!h['x-frame-options'])           list.push({severity:'low',   title:'Missing X‑Frame‑Options',fix:'Add SAMEORIGIN or DENY.'});
+    if(h['server'])                     list.push({severity:'low',   title:`Server banner: ${h['server']}`,fix:'Remove or obfuscate Server header.'});
+    return list;
+  }catch{ return [];}
+}
+
+/* Health */
+app.get('/health',(_q,r)=>r.json({status:'up'}));
+
+/* Start */
+app.listen(PORT, ()=>console.log('Proxy running on',PORT));
